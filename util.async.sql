@@ -22,20 +22,24 @@ as $$
 declare
     conn text = connstr;
 begin
-    if (conn = any(dblink_get_connections())) is not null
+    if coalesce(conn = any(dblink_get_connections()), false)
     then
         if dblink_is_busy(conn) = 1 then
             return null;
         end if;
     else
-        conn = 'util.async.' || md5(connstr);
-        if (conn = any(dblink_get_connections())) is not null
+        conn = 'util.async.' || md5(
+            connstr
+            || pg_backend_pid()::text
+            || clock_timestamp()::text
+            || random()::text
+        );
+        if coalesce(conn = any(dblink_get_connections()), false)
         then
             if dblink_is_busy(conn) = 1 then
                 return null;
             end if;
         else
-            -- _u is used!
             perform dblink_connect_u(conn, connstr);
         end if;
     end if;
@@ -95,7 +99,7 @@ end;
 $$;
 
 \if :test
-    create function tests.test_async() returns setof text language plpgsql as $$
+    create function tests.test_util_async_named_connection() returns setof text language plpgsql as $$
     declare
         conn text;
         data jsonb;
@@ -122,7 +126,14 @@ $$;
             'able to get async data');
 
         perform dblink_disconnect('my_conn');
+    end;
+    $$;
 
+    create function tests.test_util_async_anon_connection() returns setof text language plpgsql as $$
+    declare
+        conn text;
+        data jsonb;
+    begin
         conn = util.async(
             'dbname=web user=web',
             $x$select tests.delay()$x$
@@ -135,18 +146,41 @@ $$;
             (util.await(conn, 0.2))->>'hello' is not null,
             'waits async call with timeout');
 
+    end;
+    $$;
+
+    create function tests.test_util_async_timed_out() returns setof text language plpgsql as $$
+    declare
+        conn text;
+        data jsonb;
+    begin
         begin
             perform util.await(util.async(
                 'dbname=web user=web',
                 $x$select tests.delay()$x$
             ), 0.02);
-            return next ok(false, 'unable to capture timeout');
+            return next ok(false, 'unable to capture before timeout');
         exception
             when others then
             return next ok(
                 sqlerrm = 'util.async.timeout',
                 'throws timeout error');
         end;
+    end;
+    $$;
+
+
+    create function tests.test_util_async_multiple() returns setof text language plpgsql as $$
+    declare
+        async1 text;
+        async2 text;
+    begin
+        async1 = util.async('dbname=web user=web', $x$select tests.delay(0.2)$x$);
+        async2 = util.async('dbname=web user=web', $x$select tests.delay(0.1)$x$);
+        perform pg_sleep(0.3); -- do something-else
+
+        return next ok(((util.await(async1, 0.1))->>'hello')::float = 0.2, 'returns async1');
+        return next ok(((util.await(async2, 0.1))->>'hello')::float = 0.1, 'returns async2');
     end;
     $$;
 
